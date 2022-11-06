@@ -1,7 +1,7 @@
-# Score-Based Generative Modeling
 using MLDatasets
-using Flux
+using Zarr
 using NPZ
+using Flux
 using Flux: @functor, chunk, params
 using Flux.Data: DataLoader
 using Parameters: @with_kw
@@ -13,17 +13,9 @@ using ProgressMeter: Progress, next!
 using TensorBoardLogger: TBLogger, tb_overwrite
 using Random
 using Statistics
+using DifferentialEquations
+using Plots
 
-"""
-Projection of Gaussian Noise onto a time vector.
-
-# Notes
-This layer will help embed our random times onto the frequency domain. \n
-W is not trainable and is sampled once upon construction - see assertions below.
-
-# References
-paper-  https://arxiv.org/abs/2006.10739
-"""
 function GaussianFourierProjection(embed_dim, scale)
     # Instantiate W once
     W = randn(Float32, embed_dim ÷ 2) .* scale
@@ -34,38 +26,13 @@ function GaussianFourierProjection(embed_dim, scale)
     end
 end
 
-"""
-Helper function that computes the *standard deviation* of 𝒫₀ₜ(𝘹(𝘵)|𝘹(0)).
-
-# Notes
-Derived from the Stochastic Differential Equation (SDE):    \n
-                𝘥𝘹 = σᵗ𝘥𝘸,      𝘵 ∈ [0, 1]                   \n
-
-We use properties of SDEs to analytically solve for the stddev
-at time t conditioned on the data distribution. \n
-
-We will be using this all over the codebase for computing our model's loss,
-scaling our network output, and even sampling new images!
-"""
-marginal_prob_std(t, sigma=25.0f0) = sqrt.((sigma .^ (2t) .- 1.0f0) ./ 2.0f0 ./ log(sigma))
-
-"""
-Create a UNet architecture as a backbone to a diffusion model. \n
-
-# Notes
-Images stored in WHCN (width, height, channels, batch) order. \n
-In our case, MNIST comes in as (28, 28, 1, batch). \n
-
-# References
-paper-  https://arxiv.org/abs/1505.04597
-"""
 struct UNet
     layers::NamedTuple
 end
 
-"""
-User Facing API for UNet architecture.
-"""
+marginal_prob_std(t, sigma=25.0f0) = sqrt.((sigma .^ (2t) .- 1.0f0) ./ 2.0f0 ./ log(sigma))
+
+#User Facing API for UNet architecture.
 function UNet(channels=[32, 64, 128, 256], embed_dim=256, scale=30.0f0)
     return UNet((
         gaussfourierproj=GaussianFourierProjection(embed_dim, scale),
@@ -99,18 +66,10 @@ end
 
 @functor UNet
 
-"""
-Helper function that adds `dims` dimensions to the front of a `AbstractVecOrMat`.
-Similar in spirit to TensorFlow's `expand_dims` function.
-
-# References:
-https://www.tensorflow.org/api_docs/python/tf/expand_dims
-"""
+# helper to expand dims, similar to tensorflow expand dims
 expand_dims(x::AbstractVecOrMat, dims::Int=2) = reshape(x, (ntuple(i -> 1, dims)..., size(x)...))
 
-"""
-Makes the UNet struct callable and shows an example of a "Functional" API for modeling in Flux. \n
-"""
+#the UNet struct callable and shows an example of a "Functional" API for modeling in Flux. \n
 function (unet::UNet)(x, t)
     # Embedding
     embed = unet.layers.gaussfourierproj(t)
@@ -143,30 +102,6 @@ function (unet::UNet)(x, t)
     h ./ expand_dims(marginal_prob_std(t), 3)
 end
 
-"""
-Model loss following the denoising score matching objectives:
-
-# Notes
-Denoising score matching objective:
-```julia
-min wrt. θ (
-    𝔼 wrt. 𝘵 ∼ 𝒰(0, 𝘛)[
-        λ(𝘵) * 𝔼 wrt. 𝘹(0) ∼ 𝒫₀(𝘹) [
-            𝔼 wrt. 𝘹(t) ∼ 𝒫₀ₜ(𝘹(𝘵)|𝘹(0)) [
-                (||𝘚₀(𝘹(𝘵), 𝘵) - ∇ log [𝒫₀ₜ(𝘹(𝘵) | 𝘹(0))] ||₂)²
-            ]
-        ]
-    ]
-)
-``` 
-Where 𝒫₀ₜ(𝘹(𝘵) | 𝘹(0)) and λ(𝘵), are available analytically and
-𝘚₀(𝘹(𝘵), 𝘵) is estimated by a U-Net architecture.
-
-# References:
-http://www.iro.umontreal.ca/~vincentp/Publications/smdae_techreport.pdf \n
-https://yang-song.github.io/blog/2021/score/#estimating-the-reverse-sde-with-score-based-models-and-score-matching \n
-https://yang-song.github.io/blog/2019/ssm/
-"""
 function model_loss(model, x, ϵ=1.0f-5)
     batch_size = size(x)[end]
     # (batch) of random times to approximate 𝔼[⋅] wrt. 𝘪 ∼ 𝒰(0, 𝘛)
@@ -185,10 +120,7 @@ function model_loss(model, x, ϵ=1.0f-5)
     )
 end
 
-
-"""
-Helper function from DrWatson.jl to convert a struct to a dict
-"""
+#Helper function from DrWatson.jl to convert a struct to a dict
 function struct2dict(::Type{DT}, s) where {DT<:AbstractDict}
     DT(x => getfield(s, x) for x in fieldnames(typeof(s)))
 end
@@ -196,14 +128,14 @@ struct2dict(s) = struct2dict(Dict, s)
 
 # arguments for the `train` function 
 @with_kw mutable struct Args
-    η = 1e-4                     # learning rate
-    batch_size = 32             # batch size
-    epochs = 10                 # number of epochs
-    seed = 1                    # random seed
-    cuda = false                # use CPU
-    verbose_freq = 10           # logging for every verbose_freq iterations
-    tblogger = true             # log training with tensorboard
-    save_path = "output"        # results path
+    η = 1e-4                                        # learning rate
+    batch_size = 32                                 # batch size
+    epochs = 50                                     # number of epochs
+    seed = 1                                        # random seed
+    cuda = false                                    # use CPU
+    verbose_freq = 10                               # logging for every verbose_freq iterations
+    tblogger = true                                 # log training with tensorboard
+    save_path = "output"                            # results path
 end
 
 function train(; kws...)
@@ -223,14 +155,12 @@ function train(; kws...)
     # load MNIST images
     xtrain = npzread("data/raw/mnist.npy")
     loader = DataLoader((xtrain), batchsize=32, shuffle=true)
-
     # initialize UNet model
     unet = UNet() |> device
     # ADAM optimizer
     opt = ADAM(args.η)
     # parameters
     ps = Flux.params(unet)
-
     !ispath(args.save_path) && mkpath(args.save_path)
 
     # logging by TensorBoard.jl
@@ -251,6 +181,7 @@ function train(; kws...)
                 model_loss(unet, x)
             end
             Flux.Optimise.update!(opt, ps, grad)
+            # progress meter
             next!(progress; showvalues=[(:loss, loss)])
 
             # logging with TensorBoard
@@ -269,13 +200,108 @@ function train(; kws...)
         BSON.@save model_path unet args
         @info "Model saved: $(model_path)"
     end
-    return cpu(unet), struct2dict(args)
 end
 
 #if abspath(PROGRAM_FILE) == @__FILE__
-#train()
+    #train()
 #end
 
-unet, args = train()
+train()
 
-BSON.@save model_path unet args
+
+### Plotting ####
+
+#Helper function yielding the diffusion coefficient from a SDE.
+diffusion_coeff(t, sigma=convert(eltype(t), 25.0f0)) = sigma .^ t
+
+#Helper function that produces images from a batch of images.
+function convert_to_image(x, y_size)
+    Gray.(permutedims(vcat(reshape.(chunk(x |> cpu, y_size), 28, :)...), (2, 1)))
+end
+
+# Helper to make an animation from a batch of images.
+function convert_to_animation(x)
+    frames = size(x)[end]
+    batches = size(x)[end-1]
+    animation = @animate for i = 1:frames+frames÷4
+        if i <= frames
+            heatmap(
+                convert_to_image(x[:, :, :, :, i], batches),
+                title="Iteration: $i out of $frames"
+            )
+        else
+            heatmap(
+                convert_to_image(x[:, :, :, :, end], batches),
+                title="Iteration: $frames out of $frames"
+            )
+        end
+    end
+    return animation
+end
+
+#Helper function that generates inputs to a sampler.
+function setup_sampler(device, num_images=5, num_steps=500, ϵ=1.0f-3)
+    t = ones(Float32, num_images) |> device
+    init_x = (
+        randn(Float32, (28, 28, 1, num_images)) .*
+        expand_dims(marginal_prob_std(t), 3)
+    ) |> device
+    time_steps = LinRange(1.0f0, ϵ, num_steps)
+    Δt = time_steps[1] - time_steps[2]
+    return time_steps, Δt, init_x
+end
+
+function DifferentialEquations_problem(model, init_x, time_steps, Δt)
+    function f(u, p, t)
+        batch_time_step = fill!(similar(u, size(u)[end]), 1) .* t
+        return (
+            -expand_dims(diffusion_coeff(batch_time_step), 3) .^ 2 .*
+            model(u, batch_time_step)
+        )
+    end
+
+    function g(u, p, t)
+        batch_time_step = fill!(similar(u), 1) .* t
+        diffusion_coeff(batch_time_step)
+    end
+    tspan = (time_steps[begin], time_steps[end])
+    SDEProblem(f, g, init_x, tspan), ODEProblem(f, init_x, tspan)
+end
+
+function plot_result(unet, args)
+    args = Args(; args...)
+    args.seed > 0 && Random.seed!(args.seed)
+    device = args.cuda && CUDA.has_cuda() ? gpu : cpu
+    unet = unet |> device
+    time_steps, Δt, init_x = setup_sampler(device)
+    
+    # Setup an SDEProblem and ODEProblem to input to `solve()`.
+    # Use dt=Δt to make the sample paths comparable to calculating "by hand".
+    sde_problem, ode_problem = DifferentialEquations_problem(unet, init_x, time_steps, Δt)
+
+    @info "Probability Flow ODE Sampling w/ DifferentialEquations.jl"
+    diff_eq_ode = solve(ode_problem, dt=Δt, adaptive=false)
+    diff_eq_ode_end = diff_eq_ode[:, :, :, :, end]
+    diff_eq_ode_images = convert_to_image(diff_eq_ode_end, size(diff_eq_ode_end)[end])
+    save(joinpath(args.save_path, "diff_eq_ode_images.jpeg"), diff_eq_ode_images)
+    diff_eq_ode_animation = convert_to_animation(diff_eq_ode)
+    gif(diff_eq_ode_animation, joinpath(args.save_path, "diff_eq_ode.gif"), fps=50)
+    ode_plot = plot(diff_eq_ode, title="Probability Flow ODE", legend=false, ylabel="x", la=0.25)
+    plot!(time_steps, diffusion_coeff(time_steps), xflip=true, ls=:dash, lc=:red)
+    plot!(time_steps, -diffusion_coeff(time_steps), xflip=true, ls=:dash, lc=:red)
+    savefig(ode_plot, joinpath(args.save_path, "diff_eq_ode_plot.png"))
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    ############################################################################
+    # Issue loading function closures with BSON:
+    # https://github.com/JuliaIO/BSON.jl/issues/69
+    #
+    BSON.@load "output/model.bson" unet args
+    #
+    # BSON.@load does not work if defined inside plot_result(⋅) because
+    # it contains a function closure, GaussFourierProject(⋅), containing W.
+    ###########################################################################
+    plot_result(unet, args)
+end
+
